@@ -1,0 +1,42 @@
+# -*- makefile -*-
+
+all:
+
+include Make.vars
+
+# Pintos utils & tests 절대경로 (userprog 기준: ../utils, ../tests)
+PINTOS_UTILS := $(abspath ../utils)
+TESTS_DIR    := $(abspath ../tests)
+
+DIRS = $(sort $(addprefix build/,$(KERNEL_SUBDIRS) $(TEST_SUBDIRS) lib/user))
+
+# check/grade 시 PATH 주입 + tests 링크 보장
+all grade check: $(DIRS) build/Makefile build/tests
+	cd build && PATH=$(PINTOS_UTILS):$$PATH $(MAKE) $@
+
+$(DIRS):
+	mkdir -p $@
+build/Makefile: ../Makefile.build
+	cp $< $@
+
+# 테스트 하네스가 참조하는 tests/* 를 build/에서도 보이게 링크 보장
+.PHONY: build/tests
+build/tests:
+	@mkdir -p build
+	@cd build && ln -snf $(TESTS_DIR) tests
+
+build/%: $(DIRS) build/Makefile
+	cd build && $(MAKE) $*
+
+clean:
+	rm -rf build
+
+# ctags: 프로젝트 전체 태그(src/tags) 생성
+.PHONY: tags retags
+tags:
+	@echo "Generating tags at src/tags"
+	@cd .. && ctags -R --languages=C --links=no --exclude=build --exclude='*.d' \
+	        --fields=+iaS --extras=+q -f tags .
+
+retags:
+	@cd .. && rm -f tags && $(MAKE) tags
