@@ -1,0 +1,7 @@
+.DS_Store
+**/build/
+**/utils/*.o
+**/utils/setitimer-helper
+**/utils/squish-pty
+**/utils/squish-unix
+/test-results/
