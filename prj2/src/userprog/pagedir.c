@@ -136,6 +136,14 @@ pagedir_get_page (uint32_t *pd, const void *uaddr)
     return NULL;
 }
 
+/* Returns whether a present user page can be written. */
+bool
+pagedir_is_writable (uint32_t *pd, const void *upage)
+{
+  uint32_t *pte = lookup_page (pd, upage, false);
+  return pte != NULL && (*pte & (PTE_P | PTE_W)) == (PTE_P | PTE_W);
+}
+
 /* Marks user virtual page UPAGE "not present" in page
    directory PD.  Later accesses to the page will fault.  Other
    bits in the page table entry are preserved.

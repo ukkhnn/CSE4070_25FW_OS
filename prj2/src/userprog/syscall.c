@@ -1,46 +1,33 @@
 #include "userprog/syscall.h"
-#include <stdio.h>
-#include <syscall-nr.h>
-#include <string.h> //
+#include <limits.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include <syscall-nr.h>
+#include "devices/input.h"
+#include "devices/shutdown.h"
+#include "filesys/directory.h"
+#include "filesys/file.h"
+#include "filesys/filesys.h"
+#include "lib/kernel/console.h"
 #include "threads/interrupt.h"
-#include "threads/thread.h"
+#include "threads/malloc.h"
 #include "threads/synch.h"
+#include "threads/thread.h"
 #include "threads/vaddr.h"
 #include "userprog/pagedir.h"
-#include "devices/input.h"          /* input_getc() */
-#include "devices/shutdown.h"       /* shutdown_power_off() */
-#include "lib/kernel/console.h"     /* putbuf() */
-
-#include "threads/malloc.h"
-
-#include <stdbool.h>
-
-#include "userprog/process.h"   // process_execute, process_wait
-
-#include "filesys/file.h"    //[phase2] for off_t, file_seek(), file_tell()
-
-
-// [phase2][ADD] file syscalls
+#include "userprog/process.h"
 static int  sys_open (const char *name);
 static void sys_close(int fd);
 static int  sys_filesize(int fd);
 static void sys_seek(int fd, unsigned pos);
 static unsigned sys_tell(int fd);
-
-
-//[phase1]
 struct lock filesys_lock;
-
-//[phase1] 락 사용 매크로
 #define FS_LOCK()   lock_acquire(&filesys_lock)
 #define FS_UNLOCK() lock_release(&filesys_lock)
 
-
 static void syscall_handler (struct intr_frame *);
 static void sys_exit (int status) NO_RETURN;
-
-// [phase2][ADD] ---------- FD table utilities ----------
 static struct file_desc* fd_lookup(int fd) {
   if (fd < 2) return NULL; /* 0,1은 가짜 fd (stdin/stdout) */
   struct thread *t = thread_current();
@@ -53,13 +40,12 @@ static struct file_desc* fd_lookup(int fd) {
   return NULL;
 }
 
-
 static bool valid_fname_len(const char *s) {
   size_t n = 0;
   while (s && s[n] != '\0') {
-    if (++n > 14) return false;   // 14 초과 금지
+    if (++n > NAME_MAX) return false;
   }
-  return n >= 1;                  // 길이 1~14만 허용
+  return n >= 1;
 }
 
 static int fd_add(struct file *f) {
@@ -67,6 +53,7 @@ static int fd_add(struct file *f) {
   struct thread *t = thread_current();
   struct file_desc *d = malloc(sizeof *d);
   if (!d) return -1;
+  if (t->next_fd == INT_MAX) { free (d); return -1; }
   d->fd = t->next_fd++;
   d->f  = f;
   list_push_back(&t->fdt, &d->elem);
@@ -76,80 +63,65 @@ static int fd_add(struct file *f) {
 static void fd_close_entry(struct file_desc *d) {
   if (!d) return;
   FS_LOCK();
-  file_close(d->f);               // 실제 닫기 한 번만!
+  file_close(d->f);
   FS_UNLOCK();
   list_remove(&d->elem);
   free(d);
 }
-// [phase2][ADD END]
 
-
-
-
-/* p..p+n-1 바이트가 모두 유저 영역에 매핑되어 있는지 검사 */
+/* Validate an entire range by page, without overflowing its end address. */
 static bool
-validated_user_pte (const void *p, size_t n)
+validated_user_pte (const void *p, size_t n, bool writable)
 {
-  if (n == 0) return true;
-  if (p == NULL) return false;
-  const uint8_t *cur = (const uint8_t *) p;
-  const uint8_t *end = cur + (n ? n - 1 : 0);
+  uintptr_t addr = (uintptr_t) p;
+  uintptr_t limit = (uintptr_t) PHYS_BASE;
   struct thread *t = thread_current ();
+  if (n == 0) return true;
+  if (addr == 0 || addr >= limit || n > limit - addr) return false;
 
-  for (const uint8_t *addr = cur; addr <= end; addr++) {
-    if (!is_user_vaddr (addr)) return false;
-    if (pagedir_get_page (t->pagedir, addr) == NULL) return false;
-  }
-  return true;
+  uintptr_t last = addr + n - 1;
+  for (;;)
+    {
+      if (pagedir_get_page (t->pagedir, (const void *) addr) == NULL
+          || (writable && !pagedir_is_writable (t->pagedir, (const void *) addr)))
+        return false;
+      if (pg_round_down ((void *) addr) == pg_round_down ((void *) last))
+        return true;
+      addr = (uintptr_t) pg_round_down ((void *) addr) + PGSIZE;
+    }
 }
 
-/* 검증 실패 시 즉시 종료(-1) */
+/* Invalid syscall pointers terminate the caller before taking an FS lock. */
 static void
 must_validate_or_exit (const void *p, size_t n)
 {
-  if (!validated_user_pte (p, n)) {
+  if (!validated_user_pte (p, n, false)) {
     sys_exit (-1);
   }
 }
-
-
-// [ADD] 안전한 C-string 검증 (최대 PGSIZE 바이트까지 스캔)
 static void validate_cstr_or_exit(const char *s){
   if (s == NULL) sys_exit(-1);
-  // 최대 한 페이지 정도만 보면 테스트 범위(인자 < 128B)에 충분
   for (size_t i = 0; i < PGSIZE; i++){
     must_validate_or_exit(s + i, 1);
     if (s[i] == '\0') return;
   }
-  // 너무 길거나 NUL 미도달
   sys_exit(-1);
 }
-// [ADD] END
-
-
-
-
-// [ADD]
-/* 유저 스택(esp)에서 n번째 int 인자를 안전하게 꺼낸다.
-   esp[0]=sysno, esp[1]=arg0, esp[2]=arg1 ... */
+/* esp[0] is the syscall number; the remaining words are its arguments. */
 static int
 fetch_arg_i (const void *u_esp, int n)
 {
-  const uint8_t *p = (const uint8_t *)u_esp + 4 * (n + 1);
-  must_validate_or_exit (p, sizeof (int));
-  /* 페이지 경계를 고려해 바이트 단위 복사 */
-  int v = 0;
-  uint8_t *dst = (uint8_t *)&v;
-  for (size_t i = 0; i < sizeof (int); i++) {
-    const uint8_t *q = p + i;
-    if (!validated_user_pte (q, 1)) sys_exit (-1);
-    dst[i] = *q;
-  }
-  return v;
+  uintptr_t address = (uintptr_t) u_esp;
+  size_t offset = sizeof (int) * (n + 1);
+  int value;
+  if (address >= (uintptr_t) PHYS_BASE
+      || offset > (uintptr_t) PHYS_BASE - address)
+    sys_exit (-1);
+  const void *p = (const void *) (address + offset);
+  must_validate_or_exit (p, sizeof value);
+  memcpy (&value, p, sizeof value);
+  return value;
 }
-// [ADD END]
-
-// [ADD]
 int
 sys_fibonacci (int n)
 {
@@ -171,15 +143,10 @@ sys_max_of_four_int (int a, int b, int c, int d)
   if (d > m) m = d;
   return m;
 }
-//[ADD END]
-
-// [ADD] - exec/wait systemcall body
 static int
 sys_exec (const char *cmdline)
 {
   validate_cstr_or_exit(cmdline);
-  // 최소요건: 로드 동기화 없이 tid 반환
-  // busy wait 구현ㄱ
   return (int) process_execute(cmdline);
 }
 
@@ -188,44 +155,33 @@ sys_wait (int pid)
 {
   return process_wait((tid_t)pid);
 }
-// [ADD END]
 
-
-
-/* [phase2][ADD] ---- file syscalls implementation ---- */
 static int
-sys_open (const char *name) {
-  /* 문자열 검증(널 종료까지) — 네 함수가 이미 있다면 그거 사용 */
-  must_validate_or_exit(name, 1); /* 최소 유효 포인터 */
-  /* 빈 문자열 금지 */
+sys_open (const char *name)
+{
+  struct file *file;
+  int fd;
+  validate_cstr_or_exit (name);
   if (name[0] == '\0') return -1;
-
-  FS_LOCK();
-  struct file *f = filesys_open(name);
-  FS_UNLOCK();
-  if (!f) return -1;
-
-  return fd_add(f);
+  FS_LOCK ();
+  file = filesys_open (name);
+  FS_UNLOCK ();
+  if (file == NULL) return -1;
+  fd = fd_add (file);
+  if (fd == -1)
+    {
+      FS_LOCK ();
+      file_close (file);
+      FS_UNLOCK ();
+    }
+  return fd;
 }
-/*
+
 static void
 sys_close (int fd) {
   struct file_desc *d = fd_lookup(fd);
-  if (!d) return; // close-twice 조용히 무시
-  FS_LOCK();
-    //file_close 안에 락 필요 없지만 base FS 동시성 위해 감쌈
-  file_close(d->f);
-  FS_UNLOCK();
-  // fd 엔트리 제거 & free
+  if (!d) return;
   fd_close_entry(d);
-}
-*/
-
-static void
-sys_close (int fd) {
-  struct file_desc *d = fd_lookup(fd);
-  if (!d) return;                 // close-twice: 조용히 무시
-  fd_close_entry(d);              // ← 여기서만 file_close()까지 처리
 }
 
 static int
@@ -241,7 +197,7 @@ sys_filesize (int fd) {
 static void
 sys_seek (int fd, unsigned pos) {
   struct file_desc *d = fd_lookup(fd);
-  if (!d) return;
+  if (!d || pos > INT_MAX) return;
   FS_LOCK();
   file_seek(d->f, (off_t)pos);
   FS_UNLOCK();
@@ -256,12 +212,9 @@ sys_tell (int fd) {
   FS_UNLOCK();
   return p;
 }
-
-
-// sys_create
 static bool sys_create (const char *name, unsigned initial_size) {
-  must_validate_or_exit(name, 1);     // 최소 포인터 유효성(Phase 3 완성 전)
-  if (!valid_fname_len(name)) return false;
+  validate_cstr_or_exit (name);
+  if (!valid_fname_len(name) || initial_size > INT_MAX) return false;
   FS_LOCK();
   bool ok = filesys_create(name, initial_size);
   FS_UNLOCK();
@@ -269,7 +222,7 @@ static bool sys_create (const char *name, unsigned initial_size) {
 }
 /* [phase2][ADD END] ----------------------------------- */
 
-/* ---- 기본 시스템콜 일부 구현: halt/exit/read/write ---- */
+/* Process termination and standard I/O. */
 static void
 sys_halt (void)
 {
@@ -287,32 +240,10 @@ sys_exit (int status)
   NOT_REACHED ();
 }
 
-/* stdout(1) → 콘솔: filesys 락 불필요 */
+/* Console output does not need the filesystem lock. */
 static int
 sys_write (int fd, const void *buffer, unsigned size)
 {
-  /*
-  if (size == 0) return 0;
-  must_validate_or_exit (buffer, size);
-
-  if (fd == 1) {                 // STDOUT
-    char *k = malloc (size);
-    if (!k) sys_exit (-1);
-    memcpy (k, buffer, size);
-    putbuf (k, size);
-    free (k);
-    return (int) size;
-  }
-  // 파일(fd>=2)
-  struct file_desc *d = fd_lookup(fd);
-  if (!d) return -1;
-  FS_LOCK();
-  int n = file_write(d->f, buffer, size);
-  FS_UNLOCK();
-  return n;
-
-  //return -1;
-  */
 
   must_validate_or_exit(buffer, size);
   if (fd == 1) { putbuf(buffer, size); return (int)size; }
@@ -328,29 +259,8 @@ sys_write (int fd, const void *buffer, unsigned size)
 static int
 sys_read (int fd, void *buffer, unsigned size)
 {
-  /*
-  if (size == 0) return 0;
-  must_validate_or_exit (buffer, size);
-
-  // stdin(0) → 키보드: filesys 락 불필요
-  if (fd == 0) {                 // STDIN
-    uint8_t *p = buffer;
-    for (unsigned i = 0; i < size; i++)
-      p[i] = input_getc();
-    return (int) size;
-  }
-    // 파일(fd>=2)
-  struct file_desc *d = fd_lookup(fd);
-  if (!d) return -1;
-  FS_LOCK();
-  int n = file_read(d->f, buffer, size);
-  FS_UNLOCK();
-  return n;
-
-  //return -1;
-  */
-  must_validate_or_exit(buffer, size);
-  if (fd == 0) {                    // stdin
+  if (!validated_user_pte (buffer, size, true)) sys_exit (-1);
+  if (fd == 0) {
     uint8_t *p = buffer;
     for (unsigned i = 0; i < size; ++i) p[i] = input_getc();
     return (int)size;
@@ -364,7 +274,6 @@ sys_read (int fd, void *buffer, unsigned size)
 
 }
 
-
 static bool sc_inited = false;
 
 void
@@ -372,7 +281,6 @@ syscall_init (void)
 {
   if (sc_inited) return;
   intr_register_int (0x30, 3, INTR_ON, syscall_handler, "syscall");
-  //[phase1] 전역 FS 락 초기화
   lock_init(&filesys_lock);
   sc_inited = true;
 }
@@ -385,8 +293,6 @@ syscall_handler (struct intr_frame *f)
   int no = *(int *) f->esp;
 
   switch (no) {
-
-    //[ADD]
     case SYS_FIBONACCI: {
       int n = fetch_arg_i (f->esp, 0);
       f->eax = sys_fibonacci (n);
@@ -401,7 +307,6 @@ syscall_handler (struct intr_frame *f)
       f->eax = sys_max_of_four_int (a, b, c, d);
       break;
     }
-    // [ADD END]
 
     case SYS_EXEC: {
       const char *cmd = (const char *)(uintptr_t) fetch_arg_i (f->esp, 0);
@@ -416,8 +321,8 @@ syscall_handler (struct intr_frame *f)
     }
 
     case SYS_HALT: {
-      shutdown_power_off ();
-      NOT_REACHED();
+      sys_halt ();
+      NOT_REACHED ();
     }
 
     case SYS_EXIT: {
@@ -442,8 +347,7 @@ syscall_handler (struct intr_frame *f)
       break;
     }
 
-    /* 아래 9종은 Phase2/4에서 구현.
-       ─ 구현할 때 filesys/file API 호출부만 FS_LOCK()/FS_UNLOCK()으로 감싸면 Phase1 요구 충족 ─ */
+    /* File operations share the filesystem lock. */
   case SYS_CREATE: {
         const char *name = (const char *)(uintptr_t) fetch_arg_i (f->esp, 0);
         unsigned size   = (unsigned) fetch_arg_i (f->esp, 1);
@@ -451,26 +355,24 @@ syscall_handler (struct intr_frame *f)
         f->eax = sys_create(name, size) ? 1 : 0;
         break;
     }
-    case SYS_REMOVE:{
-      /* FS_LOCK(); ok = filesys_remove(name); FS_UNLOCK(); */
-        f->eax = -1;
-        break;
+    case SYS_REMOVE: {
+      const char *name = (const char *)(uintptr_t) fetch_arg_i (f->esp, 0);
+      validate_cstr_or_exit (name);
+      FS_LOCK ();
+      f->eax = filesys_remove (name);
+      FS_UNLOCK ();
+      break;
     }
-    //[phase2] [edit]
     case SYS_OPEN: {
         const char *name = (const char *)(uintptr_t) fetch_arg_i (f->esp, 0);
-        /* 문자열 경계 검사는 Phase3에서 강화. 지금은 최소 유효 포인터만. */
-        must_validate_or_exit(name, 1);
         f->eax = sys_open(name);
         break;
     }
-    //[phase2] [edit]
     case SYS_FILESIZE: {
         int fd = fetch_arg_i (f->esp, 0);
         f->eax = sys_filesize(fd);
         break;
     }
-    //[phase2] [edit]
     case SYS_SEEK: {
         int fd = fetch_arg_i (f->esp, 0);
         unsigned pos = (unsigned) fetch_arg_i (f->esp, 1);
@@ -478,13 +380,11 @@ syscall_handler (struct intr_frame *f)
         f->eax = 0;
         break;
     }
-    //[phase2] [edit]
     case SYS_TELL: {
         int fd = fetch_arg_i (f->esp, 0);
         f->eax = sys_tell(fd);
         break;
     }
-    //[phase2] [edit]
     case SYS_CLOSE: {
         int fd = fetch_arg_i (f->esp, 0);
         sys_close(fd);
@@ -497,5 +397,4 @@ syscall_handler (struct intr_frame *f)
     }
   }
 }
-
 

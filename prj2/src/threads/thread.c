@@ -472,7 +472,8 @@ init_thread (struct thread *t, const char *name, int priority)
   //[phase2][ADD] Initialize per-thread FD table
   list_init(&t->fdt);
   t->next_fd = 2;      /* 0,1 are reserved for stdin/stdout */
-  t->exec_file = NULL; // [phase5] 기본값
+  t->exec_file = NULL;
+  t->exit_code = -1; /* Abnormal termination and failed loads. */
   #endif
 
   old_level = intr_disable ();
