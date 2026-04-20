@@ -22,6 +22,7 @@ struct semaphore_elem
   {
     struct list_elem elem;      /* List element. */
     struct semaphore semaphore; /* This semaphore controls the waiter. */
+    struct thread *thread;      /* Owner, even before sema_down blocks. */
   };
 
 /* Lock. */

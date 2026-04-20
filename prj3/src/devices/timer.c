@@ -165,10 +165,11 @@ timer_sleep (int64_t ticks)
 
   ASSERT (intr_get_level () == INTR_ON);
 
+  /* Keep the deadline calculation and insertion atomic with the timer. */
+  enum intr_level old_level = intr_disable ();
   int64_t wakeup = timer_ticks () + ticks;
-
-  /* 실제로 BLOCKED 상태로 재우기 */
   thread_sleep (wakeup);
+  intr_set_level (old_level);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be

@@ -90,7 +90,9 @@ struct thread
     enum thread_status status;          /* Thread state. */
     char name[16];                      /* Name (for debugging purposes). */
     uint8_t *stack;                     /* Saved stack pointer. */
-    int priority;                       /* Priority. */
+    int priority;                       /* Effective priority. */
+    int nice;                           /* MLFQS niceness, -20 through 20. */
+    int32_t recent_cpu;                  /* MLFQS CPU usage, 17.14 fixed point. */
 
     /* [PHASE3 Donation] 원래 priority 보존용 */
     int original_priority;
@@ -119,16 +121,12 @@ struct thread
     unsigned magic;                     /* Detects stack overflow. */
   };
 
-/* If false (default), use round-robin scheduler.
-   If true, use multi-level feedback queue scheduler.
-   Controlled by kernel command-line option "-o mlfqs". */
+/* Use priority scheduling by default, or MLFQS with "-mlfqs". */
 extern bool thread_mlfqs;
 
 /* [PHASE4 Aging] */
 extern bool thread_prior_aging;
 
-//[PHASE3 Donation]
-extern struct list ready_list;
 
 
 void thread_init (void);
@@ -149,6 +147,7 @@ const char *thread_name (void);
 
 void thread_exit (void) NO_RETURN;
 void thread_yield (void);
+void thread_preempt (void);
 
 /* Performs some operation on thread t, given auxiliary data AUX. */
 typedef void thread_action_func (struct thread *t, void *aux);

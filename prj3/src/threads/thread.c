@@ -4,6 +4,7 @@
 #include <random.h>
 #include <stdio.h>
 #include <string.h>
+#include "devices/timer.h"
 #include "threads/flags.h"
 #include "threads/interrupt.h"
 #include "threads/intr-stubs.h"
@@ -20,9 +21,8 @@
    of thread.h for details. */
 #define THREAD_MAGIC 0xcd6abf4b
 
-/* List of processes in THREAD_READY state, that is, processes
-   that are ready to run but not actually running. */
-//static struct list ready_list;
+/* Runnable threads, sorted by effective priority. */
+static struct list ready_list;
 
 /* List of all processes.  Processes are added to this list
    when they are first scheduled and removed when they exit. */
@@ -54,16 +54,15 @@ static long long user_ticks;    /* # of timer ticks in user programs. */
 #define TIME_SLICE 4            /* # of timer ticks to give each thread. */
 static unsigned thread_ticks;   /* # of timer ticks since last yield. */
 
-/* If false (default), use round-robin scheduler.
-   If true, use multi-level feedback queue scheduler.
-   Controlled by kernel command-line option "-o mlfqs". */
+/* Use priority scheduling by default, or MLFQS with "-mlfqs". */
 bool thread_mlfqs;
 
-//[PHASE4 Aging]
+/* Optional priority-aging policy used by the course. */
 bool thread_prior_aging;
 
-//[PHASE3 Donation]
-struct list ready_list;
+/* Signed 17.14 fixed-point values keep scheduler arithmetic off the FPU. */
+#define FP_ONE (1 << 14)
+static int32_t load_avg;
 
 static void kernel_thread (thread_func *, void *aux);
 
@@ -79,6 +78,9 @@ static tid_t allocate_tid (void);
 
 /*[PHASE2 - Priority]*/
 static bool priority_more (const struct list_elem *a, const struct list_elem *b, void *aux);
+static void mlfqs_update_priority (struct thread *, void *aux);
+static void mlfqs_update_recent_cpu (struct thread *, void *aux);
+static int fixed_round (int64_t);
 
 /* Initializes the threading system by transforming the code
    that's currently running into a thread.  This can't work in
@@ -126,35 +128,21 @@ thread_start (void)
   sema_down (&idle_started);
 }
 
-/* [PHASE4 Aging] : ready_list의 모든 스레드 우선순위 1 증가 */
+/* Raise waiting threads' effective priorities without exceeding PRI_MAX. */
 void
 thread_aging (void)
 {
   struct list_elem *e;
 
-  /* ready_list를 순회하며 우선순위 증가 */
+  ASSERT (intr_get_level () == INTR_OFF);
   for (e = list_begin (&ready_list); e != list_end (&ready_list); e = list_next (e))
     {
       struct thread *t = list_entry (e, struct thread, elem);
-
-      /* 우선순위는 PRI_MAX를 넘을 수 없음 */
       if (t->priority < PRI_MAX)
-        {
-          t->priority++;
-          /* donation 받은 priority가 아니라면 original도 올려주는 것이 일반적이나,
-             과제 명세에 따라 단순 priority만 올려도 됨.
-             여기서는 priority만 올림. */
-        }
+        t->priority++;
     }
-
-  /* 우선순위가 바뀌었으므로 리스트 정렬 상태가 깨질 수 있음.
-     (모두 +1이면 순서는 유지되지만, PRI_MAX에 도달한 놈과 아닌 놈이 섞이면 깨짐)
-     안전하게 다시 정렬해주거나, 이번 과제 범위에서는 생략해도 될 수 있으나
-     확실하게 하기 위해 정렬 코드를 넣는 것이 좋음. */
-  if (!list_empty (&ready_list))
-    list_sort (&ready_list, priority_more, NULL);
+  list_sort (&ready_list, priority_more, NULL);
 }
-
 
 /* Called by the timer interrupt handler at each timer tick.
    Thus, this function runs in an external interrupt context. */
@@ -177,9 +165,28 @@ thread_tick (void)
   if (++thread_ticks >= TIME_SLICE)
     intr_yield_on_return ();
 
-    /* [PHASE4]  Aging 구현 */
-  if (thread_prior_aging == true)
+  if (thread_mlfqs)
+    {
+      int64_t now = timer_ticks ();
+      if (t != idle_thread)
+        t->recent_cpu += FP_ONE;
+
+      if (now % TIMER_FREQ == 0)
+        {
+          int ready_threads = list_size (&ready_list) + (t != idle_thread);
+          load_avg = (59 * (int64_t) load_avg + ready_threads * FP_ONE) / 60;
+          thread_foreach (mlfqs_update_recent_cpu, NULL);
+        }
+      if (now % TIME_SLICE == 0)
+        {
+          thread_foreach (mlfqs_update_priority, NULL);
+          list_sort (&ready_list, priority_more, NULL);
+        }
+    }
+  else if (thread_prior_aging)
     thread_aging ();
+
+  thread_preempt ();
 }
 
 /* Prints thread statistics. */
@@ -202,9 +209,8 @@ thread_print_stats (void)
    scheduled.  Use a semaphore or some other form of
    synchronization if you need to ensure ordering.
 
-   The code provided sets the new thread's `priority' member to
-   PRIORITY, but no actual priority scheduling is implemented.
-   Priority scheduling is the goal of Problem 1-3. */
+   The new thread uses PRIORITY unless MLFQS is active, in which
+   case it inherits the creator's nice value and recent CPU usage. */
 tid_t
 thread_create (const char *name, int priority,
                thread_func *function, void *aux)
@@ -225,6 +231,12 @@ thread_create (const char *name, int priority,
   /* Initialize thread. */
   init_thread (t, name, priority);
   tid = t->tid = allocate_tid ();
+  if (thread_mlfqs && function == idle)
+    {
+      t->priority = PRI_MIN;
+      t->nice = 0;
+      t->recent_cpu = 0;
+    }
 
   /* Stack frame for kernel_thread(). */
   kf = alloc_frame (t, sizeof *kf);
@@ -244,8 +256,7 @@ thread_create (const char *name, int priority,
   /* Add to run queue. */
   thread_unblock (t);
 
-  if (t->priority > thread_current ()->priority)
-    thread_yield ();
+  thread_preempt ();
 
   return tid;
 }
@@ -289,14 +300,6 @@ thread_unblock (struct thread *t)
   list_insert_ordered (&ready_list, &t->elem, priority_more, NULL);
 
   t->status = THREAD_READY;
-
-  /* 현재 실행 중인 스레드보다 방금 깨운 스레드(t)가 더 세면 양보 요청 */
-  if (thread_current () != idle_thread &&
-      t->priority > thread_current ()->priority)
-    {
-      /* 여기서 바로 yield를 호출 */
-      thread_yield ();
-    }
 
   intr_set_level (old_level);
 }
@@ -396,59 +399,42 @@ thread_foreach (thread_action_func *func, void *aux)
     }
 }
 
-/* Sets the current thread's priority to NEW_PRIORITY. */
-/* [PHASE2 - Priority] Donation 미구현 버전: 기본 priority만 다룬다. */
-/*
+/* Yield only after the caller has completed its atomic state update. */
 void
-thread_set_priority (int new_priority)
+thread_preempt (void)
 {
-  struct thread *cur = thread_current ();
-  enum intr_level old_level;
+  enum intr_level old_level = intr_disable ();
 
-  old_level = intr_disable ();
-
-  int old_priority = cur->priority;
-  cur->priority = new_priority;
-
-  // priority를 낮췄고, ready_list에 나보다 높은 priority가 있으면 양보
-  if (new_priority < old_priority)
+  if (!list_empty (&ready_list))
     {
-      if (!list_empty (&ready_list))
+      struct thread *next = list_entry (list_front (&ready_list), struct thread, elem);
+      if (next->priority > thread_current ()->priority)
         {
-          struct thread *front =
-            list_entry (list_front (&ready_list), struct thread, elem);
-          if (front->priority > cur->priority)
+          if (intr_context ())
+            intr_yield_on_return ();
+          else
             thread_yield ();
         }
     }
-
   intr_set_level (old_level);
 }
-*/
 
-/* [PHASE3 Donation] priority를 바꾸면 original_priority를 바꾸고,
-   donation까지 고려한 priority를 새로 계산 */
+/* Set the base priority; any active donation still takes precedence. */
 void
 thread_set_priority (int new_priority)
 {
-  struct thread *cur = thread_current ();
-  enum intr_level old_level = intr_disable ();
+  enum intr_level old_level;
 
-  cur->original_priority = new_priority;
+  ASSERT (PRI_MIN <= new_priority && new_priority <= PRI_MAX);
+  if (thread_mlfqs)
+    return;
+
+  old_level = intr_disable ();
+  thread_current ()->original_priority = new_priority;
   refresh_priority ();
-
-  // 만약 ready_list에 나보다 높은 priority가 있으면 양보
-  if (!list_empty (&ready_list))
-    {
-      struct thread *front =
-        list_entry (list_front (&ready_list), struct thread, elem);
-      if (front->priority > cur->priority)
-        thread_yield ();
-    }
-
+  thread_preempt ();
   intr_set_level (old_level);
 }
-
 
 /* [PHASE2 Priority] Compare function: higher priority comes first. */
 static bool
@@ -480,35 +466,71 @@ thread_get_priority (void)
   return thread_current ()->priority;
 }
 
-/* Sets the current thread's nice value to NICE. */
-void
-thread_set_nice (int nice UNUSED)
+/* Round a fixed-point value to the nearest integer, including negatives. */
+static int
+fixed_round (int64_t value)
 {
-  /* Not yet implemented. */
+  return (value >= 0 ? value + FP_ONE / 2 : value - FP_ONE / 2) / FP_ONE;
 }
 
-/* Returns the current thread's nice value. */
+static void
+mlfqs_update_priority (struct thread *t, void *aux UNUSED)
+{
+  int priority;
+  if (t == idle_thread)
+    return;
+  priority = PRI_MAX - t->recent_cpu / (4 * FP_ONE) - 2 * t->nice;
+  t->priority = priority < PRI_MIN ? PRI_MIN : priority > PRI_MAX ? PRI_MAX : priority;
+}
+
+static void
+mlfqs_update_recent_cpu (struct thread *t, void *aux UNUSED)
+{
+  int32_t coefficient;
+  if (t == idle_thread)
+    return;
+  coefficient = (int64_t) (2 * load_avg) * FP_ONE / (2 * load_avg + FP_ONE);
+  t->recent_cpu = (int64_t) coefficient * t->recent_cpu / FP_ONE + t->nice * FP_ONE;
+}
+
+void
+thread_set_nice (int nice)
+{
+  enum intr_level old_level;
+  ASSERT (nice >= -20 && nice <= 20);
+  old_level = intr_disable ();
+  thread_current ()->nice = nice;
+  if (thread_mlfqs)
+    {
+      mlfqs_update_priority (thread_current (), NULL);
+      thread_preempt ();
+    }
+  intr_set_level (old_level);
+}
+
 int
 thread_get_nice (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  return thread_current ()->nice;
 }
 
-/* Returns 100 times the system load average. */
+/* Return the statistics scaled by 100, rounded to the nearest integer. */
 int
 thread_get_load_avg (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  enum intr_level old_level = intr_disable ();
+  int value = fixed_round ((int64_t) 100 * load_avg);
+  intr_set_level (old_level);
+  return value;
 }
 
-/* Returns 100 times the current thread's recent_cpu value. */
 int
 thread_get_recent_cpu (void)
 {
-  /* Not yet implemented. */
-  return 0;
+  enum intr_level old_level = intr_disable ();
+  int value = fixed_round ((int64_t) 100 * thread_current ()->recent_cpu);
+  intr_set_level (old_level);
+  return value;
 }
 
 /* Idle thread.  Executes when no other thread is ready to run.
@@ -606,6 +628,15 @@ init_thread (struct thread *t, const char *name, int priority)
   /* [PHASE3 Donation] 기부 리스트 초기화 */
   list_init (&t->donations);
 
+  if (thread_mlfqs)
+    {
+      if (t != initial_thread)
+        {
+          t->nice = thread_current ()->nice;
+          t->recent_cpu = thread_current ()->recent_cpu;
+        }
+      mlfqs_update_priority (t, NULL);
+    }
   t->magic = THREAD_MAGIC;
 
   old_level = intr_disable ();
@@ -776,48 +807,19 @@ remove_with_lock (struct lock *lock)
     }
 }
 
-/* [PHASE3 Donation] original_priority와 donations를 기반으로 priority 재계산 */
-/*
+/* Recompute the running thread's effective priority. */
 void
 refresh_priority (void)
 {
   struct thread *cur = thread_current ();
 
-  // 기본은 원래 priority
   cur->priority = cur->original_priority;
-
-  // 기부 받은 게 있다면, 그 중 가장 높은 priority로 올림
   if (!list_empty (&cur->donations))
     {
+      struct thread *front;
       list_sort (&cur->donations, donation_more, NULL);
-      struct thread *front =
-        list_entry (list_front (&cur->donations), struct thread, donation_elem);
+      front = list_entry (list_front (&cur->donations), struct thread, donation_elem);
       if (front->priority > cur->priority)
         cur->priority = front->priority;
     }
-
-  // ready_list 재정렬
-  list_sort (&ready_list, priority_more, NULL);
-}
-*/
-
-void
-refresh_priority (void)
-{
-  struct thread *cur = thread_current ();
-
-  /* 기본은 원래 priority */
-  cur->priority = cur->original_priority;
-
-  /* 기부 받은 게 있다면, 그 중 가장 높은 priority로 올림 */
-  if (!list_empty (&cur->donations))
-    {
-      list_sort (&cur->donations, donation_more, NULL);
-      struct thread *front =
-        list_entry (list_front (&cur->donations), struct thread, donation_elem);
-      if (front->priority > cur->priority)
-        cur->priority = front->priority;
-    }
-
-  /* ready_list 재정렬: RUNNING 스레드가 Ready List에 없으므로 불필요. 제거함 */
 }
