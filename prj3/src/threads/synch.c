@@ -225,6 +225,31 @@ lock_init (struct lock *lock)
   sema_init (&lock->semaphore, 1);
 }
 
+/* Complete acquisition with interrupts disabled.  The previous owner
+   removed these donations when releasing LOCK; remaining waiters now
+   donate to the new owner instead. */
+static void
+lock_take_ownership (struct lock *lock)
+{
+  struct thread *cur = thread_current ();
+
+  ASSERT (intr_get_level () == INTR_OFF);
+  lock->holder = cur;
+  if (!thread_mlfqs)
+    {
+      struct list_elem *e;
+
+      for (e = list_begin (&lock->semaphore.waiters);
+           e != list_end (&lock->semaphore.waiters); e = list_next (e))
+        {
+          struct thread *waiter = list_entry (e, struct thread, elem);
+          list_push_back (&cur->donations, &waiter->donation_elem);
+          if (waiter->priority > cur->priority)
+            cur->priority = waiter->priority;
+        }
+    }
+}
+
 /* Acquires LOCK, sleeping until it becomes available if
    necessary.  The lock must not already be held by the current
    thread.
@@ -244,17 +269,23 @@ lock_acquire (struct lock *lock)
   ASSERT (!lock_held_by_current_thread (lock));
 
   old_level = intr_disable ();
-  if (!thread_mlfqs && lock->holder != NULL)
+  while (!sema_try_down (&lock->semaphore))
     {
-      /* Track every waiter so a later donation can propagate through it. */
-      cur->waiting_lock = lock;
-      list_insert_ordered (&lock->holder->donations, &cur->donation_elem,
-                           donation_more, NULL);
-      donate_priority ();
+      if (!thread_mlfqs)
+        {
+          /* Register again on every retry: another thread may acquire
+             the released lock before an awakened waiter runs. */
+          cur->waiting_lock = lock;
+          list_insert_ordered (&lock->holder->donations, &cur->donation_elem,
+                               donation_more, NULL);
+          donate_priority ();
+        }
+      list_insert_ordered (&lock->semaphore.waiters, &cur->elem,
+                           sema_priority_more, NULL);
+      thread_block ();
     }
-  sema_down (&lock->semaphore);
   cur->waiting_lock = NULL;
-  lock->holder = cur;
+  lock_take_ownership (lock);
   intr_set_level (old_level);
 }
 
@@ -276,7 +307,7 @@ lock_try_acquire (struct lock *lock)
   old_level = intr_disable ();
   success = sema_try_down (&lock->semaphore);
   if (success)
-    lock->holder = thread_current ();
+    lock_take_ownership (lock);
   intr_set_level (old_level);
   return success;
 }
