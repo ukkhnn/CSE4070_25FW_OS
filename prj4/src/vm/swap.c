@@ -45,7 +45,7 @@ swap_out (const void *kpage)
 
   if (slot == BITMAP_ERROR) {
     lock_release (&swap_lock);
-    PANIC("Swap Disk Full"); // 실제 OS면 프로세스 종료지만, 여기선 PANIC
+    return SIZE_MAX;
   }
 
   /* 해당 슬롯의 섹터들에 페이지 내용 쓰기 */
@@ -66,7 +66,7 @@ swap_in (size_t slot, void *kpage)
 
   lock_acquire (&swap_lock);
 
-  if (bitmap_test (swap_map, slot) == false) {
+  if (slot >= bitmap_size (swap_map) || !bitmap_test (swap_map, slot)) {
     lock_release (&swap_lock);
     return false; // 이미 비어있는 슬롯 접근 시 에러
   }
@@ -78,7 +78,6 @@ swap_in (size_t slot, void *kpage)
                 kpage + (i * BLOCK_SECTOR_SIZE));
   }
 
-  /* 다 읽었으면 해당 슬롯을 Free(0) 상태로 변경 */
   bitmap_flip (swap_map, slot);
 
   lock_release (&swap_lock);
@@ -91,8 +90,8 @@ swap_free (size_t slot)
   if (!swap_map) return;
 
   lock_acquire (&swap_lock);
-  if (bitmap_test (swap_map, slot)) {
-    bitmap_flip (swap_map, slot);
+  if (slot < bitmap_size (swap_map) && bitmap_test (swap_map, slot)) {
+    bitmap_reset (swap_map, slot);
   }
   lock_release (&swap_lock);
 }
