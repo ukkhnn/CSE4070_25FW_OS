@@ -13,13 +13,14 @@ struct frame {
     struct thread *owner;      // 프레임 소유 스레드
     struct list_elem elem;     // frame_table 리스트 연결용
     bool pinned;               // [Phase 5 Fix] Eviction 방지 플래그
-    bool is_dying;             // [Phase 5 Fix] 종료 중 플래그
+    bool evicting;             /* Backing-store I/O owns this frame. */
 };
 
 void frame_init (void);
 void *frame_alloc (enum palloc_flags flags, struct spte *spte);
 void frame_free (void *kpage);
-void evict_frame (void);
+void frame_discard (struct spte *spte);
+void *frame_pin (struct spte *spte);
 void vm_frame_unpin (void *kpage); // [Phase 5 Fix] 프로토타입 추가
 
 #endif /* vm/frame.h */
