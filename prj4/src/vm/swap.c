@@ -78,7 +78,7 @@ swap_in (size_t slot, void *kpage)
                 kpage + (i * BLOCK_SECTOR_SIZE));
   }
 
-  bitmap_flip (swap_map, slot);
+  /* Keep the slot until the caller installs the page successfully. */
 
   lock_release (&swap_lock);
   return true;

@@ -2,6 +2,7 @@
 #define VM_PAGE_H
 
 #include <hash.h>
+#include <list.h>
 #include "filesys/file.h"
 
 /* [Phase 5] Page Type Enum 정의 수정 */
@@ -39,7 +40,7 @@ struct supplemental_page_table {
 };
 
 /* Functions */
-void spt_init (struct supplemental_page_table *spt);
+bool spt_init (struct supplemental_page_table *spt);
 void spt_destroy (struct supplemental_page_table *spt);
 struct spte *spt_find (struct supplemental_page_table *spt, void *vaddr);
 bool spt_insert (struct supplemental_page_table *spt, struct spte *spte);

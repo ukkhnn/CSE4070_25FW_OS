@@ -19,7 +19,7 @@ void swap_init (void);
 /* Swap-out: write kpage to swap, returns slot index (SIZE_MAX on failure). */
 size_t swap_out (const void *kpage);
 
-/* Swap-in: read swap slot into kpage. */
+/* Read a slot without releasing it; call swap_free after installing the page. */
 bool swap_in (size_t slot, void *kpage);
 
 /* Free a swap slot. */
