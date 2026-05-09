@@ -14,6 +14,14 @@
 
 extern struct lock filesys_lock;
 
+struct mapping
+  {
+    int id;
+    void *addr;
+    size_t pages;
+    struct list_elem elem;
+  };
+
 static unsigned
 spte_hash (const struct hash_elem *e, void *aux UNUSED)
 {
@@ -64,6 +72,8 @@ bool
 spt_init (struct supplemental_page_table *spt)
 {
   ASSERT (spt != NULL);
+  list_init (&spt->mappings);
+  spt->next_mapid = 0;
   return hash_init (&spt->pages, spte_hash, spte_less, NULL);
 }
 
@@ -71,6 +81,8 @@ void
 spt_destroy (struct supplemental_page_table *spt)
 {
   ASSERT (spt != NULL);
+  while (!list_empty (&spt->mappings))
+    vm_munmap (list_entry (list_front (&spt->mappings), struct mapping, elem)->id);
   hash_destroy (&spt->pages, spte_destroy_action);
 }
 
@@ -223,4 +235,95 @@ vm_load_page (struct spte *spte)
 
   frame_free (kpage);
   return false;
+}
+
+/* Each mapped page owns a reopened file handle.  Closing the original
+   descriptor, removing its name, and unmapping are independent operations. */
+int
+vm_mmap (struct file *file, void *addr)
+{
+  struct thread *t = thread_current ();
+  struct supplemental_page_table *spt = t->spt;
+  if (file == NULL || spt == NULL || addr == NULL || pg_ofs (addr) != 0
+      || !is_user_vaddr (addr))
+    return -1;
+
+  lock_acquire (&filesys_lock);
+  off_t length = file_length (file);
+  lock_release (&filesys_lock);
+  if (length <= 0 || (size_t) length > (uintptr_t) PHYS_BASE - (uintptr_t) addr)
+    return -1;
+  size_t pages = ((size_t) length + PGSIZE - 1) / PGSIZE;
+  for (size_t i = 0; i < pages; i++)
+    if (spt_find (spt, (uint8_t *) addr + i * PGSIZE) != NULL)
+      return -1;
+
+  struct mapping *mapping = malloc (sizeof *mapping);
+  if (mapping == NULL)
+    return -1;
+  mapping->id = spt->next_mapid++;
+  mapping->addr = addr;
+  mapping->pages = 0;
+  list_push_back (&spt->mappings, &mapping->elem);
+
+  for (size_t i = 0; i < pages; i++)
+    {
+      struct spte *page = calloc (1, sizeof *page);
+      if (page == NULL)
+        goto fail;
+      page->vaddr = (uint8_t *) addr + i * PGSIZE;
+      page->type = VM_MMAP;
+      page->writable = true;
+      page->ofs = i * PGSIZE;
+      size_t remaining = length - page->ofs;
+      page->read_bytes = remaining < PGSIZE ? remaining : PGSIZE;
+      page->zero_bytes = PGSIZE - page->read_bytes;
+      page->swap_slot = SIZE_MAX;
+      lock_acquire (&filesys_lock);
+      page->file = file_reopen (file);
+      lock_release (&filesys_lock);
+      if (page->file == NULL)
+        {
+          free (page);
+          goto fail;
+        }
+      if (!spt_insert (spt, page))
+        {
+          spte_destroy_action (&page->helem, NULL);
+          goto fail;
+        }
+      mapping->pages++;
+    }
+  return mapping->id;
+
+fail:
+  vm_munmap (mapping->id);
+  return -1;
+}
+
+void
+vm_munmap (int mapid)
+{
+  struct supplemental_page_table *spt = thread_current ()->spt;
+  if (spt == NULL)
+    return;
+  for (struct list_elem *e = list_begin (&spt->mappings);
+       e != list_end (&spt->mappings); e = list_next (e))
+    {
+      struct mapping *m = list_entry (e, struct mapping, elem);
+      if (m->id != mapid)
+        continue;
+      for (size_t i = 0; i < m->pages; i++)
+        {
+          struct spte *page = spt_find (spt, (uint8_t *) m->addr + i * PGSIZE);
+          if (page != NULL)
+            {
+              spt_remove (spt, page);
+              spte_destroy_action (&page->helem, NULL);
+            }
+        }
+      list_remove (&m->elem);
+      free (m);
+      return;
+    }
 }

@@ -37,6 +37,8 @@ struct spte {
 /* Supplemental Page Table Main Structure */
 struct supplemental_page_table {
     struct hash pages;
+    struct list mappings;
+    int next_mapid;
 };
 
 /* Functions */
@@ -47,5 +49,8 @@ bool spt_insert (struct supplemental_page_table *spt, struct spte *spte);
 void spt_remove (struct supplemental_page_table *spt, struct spte *spte);
 bool vm_try_stack_growth (void *addr, void *esp);
 bool vm_load_page (struct spte *spte);
+
+int vm_mmap (struct file *file, void *addr);
+void vm_munmap (int mapid);
 
 #endif /* vm/page.h */
