@@ -473,6 +473,7 @@ init_thread (struct thread *t, const char *name, int priority)
   list_init(&t->fdt);
   t->next_fd = 2;      /* 0,1 are reserved for stdin/stdout */
   t->exec_file = NULL; // [phase5] 기본값
+  t->exit_code = -1;
   #endif
 
   old_level = intr_disable ();

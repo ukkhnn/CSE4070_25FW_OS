@@ -27,116 +27,173 @@ extern struct lock filesys_lock;
 
 #define MAX_ARGC 64
 
-/* 자식 프로세스 관리를 위한 구조체 및 리스트 */
-struct exec_sync {
-  struct semaphore done;   // 자식 로드 완료 대기
-  bool success;            // load() 성공 여부
-  char *cmdline;           // 커맨드라인 전달용
-};
+/* A record belongs to its parent until wait() consumes it or the parent
+   exits.  An orphaned live child owns the record until it exits. */
+struct child_rec
+  {
+    tid_t parent;
+    tid_t child;
+    int exit_code;
+    bool dead;
+    bool waited;
+    struct semaphore done;
+    struct list_elem elem;
+  };
 
-struct child_rec {
-  tid_t parent;
-  tid_t child;
-  int   exit_code;
-  bool  dead;
-  bool  waited;
-  struct semaphore done;
-  struct list_elem elem;
-};
+struct exec_sync
+  {
+    struct semaphore done;
+    bool success;
+    char *cmdline;
+    struct child_rec *child;
+  };
 
 static struct list child_table;
 static struct lock child_lock;
 static bool ct_inited;
 
-static void ct_init_once(void){
-  if (!ct_inited){
-    list_init(&child_table);
-    lock_init(&child_lock);
-    ct_inited = true;
-  }
-}
-
-static void ct_add(tid_t parent, tid_t child){
-  ct_init_once();
-  struct child_rec *r = malloc(sizeof *r);
-  if(!r) return;
-  r->parent = parent; r->child = child;
-  r->exit_code = -1; r->dead = false; r->waited = false;
-  sema_init(&r->done, 0);
-  lock_acquire(&child_lock);
-  list_push_back(&child_table, &r->elem);
-  lock_release(&child_lock);
-}
-
-static struct child_rec* ct_find(tid_t parent, tid_t child){
-  struct list_elem *e;
-  for (e = list_begin(&child_table); e != list_end(&child_table); e = list_next(e)){
-    struct child_rec *r = list_entry(e, struct child_rec, elem);
-    if (r->parent == parent && r->child == child) return r;
-  }
-  return NULL;
-}
-
-static void ct_set_exit(tid_t child, int exit_code){
-  ct_init_once();
-  lock_acquire(&child_lock);
-
-  for (struct list_elem *e = list_begin(&child_table) ; e != list_end(&child_table); e = list_next(e)){
-    struct child_rec *r = list_entry(e, struct child_rec, elem);
-    if (r->child == child){
-      r->exit_code = exit_code;
-      if (!r->dead) {
-        r->dead = true;
-        sema_up(&r->done);
-      }
-      break;
-    }
-  }
-  lock_release(&child_lock);
-}
-
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
 
-/* Starts a new thread running a user program loaded from
-   FILENAME.  The new thread may be scheduled (and may even exit)
-   before process_execute() returns.  Returns the new process's
-   thread id, or TID_ERROR if the thread cannot be created. */
+static void
+ct_init_once (void)
+{
+  enum intr_level old_level = intr_disable ();
+  if (!ct_inited)
+    {
+      list_init (&child_table);
+      lock_init (&child_lock);
+      ct_inited = true;
+    }
+  intr_set_level (old_level);
+}
+
+/* The caller holds child_lock. */
+static struct child_rec *
+ct_find (tid_t parent, tid_t child)
+{
+  struct list_elem *e;
+  for (e = list_begin (&child_table); e != list_end (&child_table);
+       e = list_next (e))
+    {
+      struct child_rec *r = list_entry (e, struct child_rec, elem);
+      if (r->parent == parent && r->child == child)
+        return r;
+    }
+  return NULL;
+}
+
+static void
+ct_set_exit (tid_t child, int exit_code)
+{
+  struct list_elem *e;
+  lock_acquire (&child_lock);
+  for (e = list_begin (&child_table); e != list_end (&child_table);
+       e = list_next (e))
+    {
+      struct child_rec *r = list_entry (e, struct child_rec, elem);
+      if (r->child == child)
+        {
+          if (r->parent == TID_ERROR)
+            {
+              list_remove (&r->elem);
+              free (r);
+            }
+          else
+            {
+              r->exit_code = exit_code;
+              r->dead = true;
+              sema_up (&r->done);
+            }
+          break;
+        }
+    }
+  lock_release (&child_lock);
+}
+
+static void
+ct_orphan_children (tid_t parent)
+{
+  struct list_elem *e;
+  lock_acquire (&child_lock);
+  e = list_begin (&child_table);
+  while (e != list_end (&child_table))
+    {
+      struct child_rec *r = list_entry (e, struct child_rec, elem);
+      e = list_next (e);
+      if (r->parent != parent)
+        continue;
+      if (r->dead)
+        {
+          list_remove (&r->elem);
+          free (r);
+        }
+      else
+        r->parent = TID_ERROR;
+    }
+  lock_release (&child_lock);
+}
+
+/* Creates a child and waits until loading succeeds or fails. */
 tid_t
 process_execute (const char *file_name)
 {
-  char *page = palloc_get_page (0);
-  if (page == NULL) return TID_ERROR;
-  strlcpy (page, file_name, PGSIZE);
+  char *page;
+  struct exec_sync *xs;
+  struct child_rec *child;
+  char prog[NAME_MAX + 1];
+  char *save_ptr, *prog_name;
+  tid_t tid;
+  bool success;
 
-  struct exec_sync *xs = malloc(sizeof *xs);
-  if (!xs) { palloc_free_page(page); return TID_ERROR; }
-  sema_init(&xs->done, 0);
+  if (strlen (file_name) >= PGSIZE)
+    return TID_ERROR;
+  strlcpy (prog, file_name, sizeof prog);
+  prog_name = strtok_r (prog, " \t", &save_ptr);
+  if (prog_name == NULL)
+    return TID_ERROR;
+
+  ct_init_once ();
+  page = palloc_get_page (0);
+  if (page == NULL)
+    return TID_ERROR;
+  strlcpy (page, file_name, PGSIZE);
+  xs = malloc (sizeof *xs);
+  child = malloc (sizeof *child);
+  if (xs == NULL || child == NULL)
+    {
+      free (xs);
+      free (child);
+      palloc_free_page (page);
+      return TID_ERROR;
+    }
+  child->parent = thread_current ()->tid;
+  child->child = TID_ERROR;
+  child->exit_code = -1;
+  child->dead = child->waited = false;
+  sema_init (&child->done, 0);
+  sema_init (&xs->done, 0);
   xs->success = false;
   xs->cmdline = page;
+  xs->child = child;
 
-  char prog[NAME_MAX + 1];
-  strlcpy(prog, file_name, sizeof prog);
-  char *sp, *prog_name = strtok_r(prog, " \t", &sp);
-  if (!prog_name) prog_name = "unknown";
+  tid = thread_create (prog_name, PRI_DEFAULT, start_process, xs);
+  if (tid == TID_ERROR)
+    {
+      palloc_free_page (page);
+      free (child);
+      free (xs);
+      return TID_ERROR;
+    }
 
-  tid_t tid = thread_create (prog_name, PRI_DEFAULT, start_process, xs);
-  if (tid == TID_ERROR) {
-    palloc_free_page(page);
-    free(xs);
-    return TID_ERROR;
-  }
-
-  ct_add(thread_current()->tid, tid);
-
-  sema_down(&xs->done);
-
-  if (!xs->success) {
-    free(xs);
-    return TID_ERROR;
-  }
-
-  free(xs);
+  sema_down (&xs->done);
+  success = xs->success;
+  free (xs);
+  if (!success)
+    {
+      process_wait (tid);
+      return TID_ERROR;
+    }
   return tid;
 }
 
@@ -144,112 +201,106 @@ static void
 start_process (void *aux)
 {
   struct exec_sync *xs = aux;
-  char *full_cmdline = xs->cmdline;
-
+  struct child_rec *child = xs->child;
   struct intr_frame if_;
+  char *prog, *save_ptr, *prog_name;
   bool success = false;
 
-  thread_current()->cmdline = full_cmdline;
-
-  char *prog = palloc_get_page(0);
-  if (prog == NULL) {
-    xs->success = false;
-    sema_up(&xs->done);
-    thread_current()->exit_code = -1; // [Phase 5] 실패 시 -1 설정
-    thread_exit();
-  }
-  strlcpy(prog, full_cmdline, PGSIZE);
-  char *sp, *prog_name = strtok_r(prog, " \t", &sp);
-
-  if (!prog_name) {
-      palloc_free_page(prog);
-      xs->success = false;
-      sema_up(&xs->done);
-      thread_current()->exit_code = -1; // [Phase 5] 실패 시 -1 설정
-      thread_exit();
-  }
-
-  memset (&if_, 0, sizeof if_);
-  if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
-  if_.cs = SEL_UCSEG;
-  if_.eflags = FLAG_IF | FLAG_MBS;
-
-  success = load (prog_name, &if_.eip, &if_.esp);
+  /* Publish status before loading: even a child that exits immediately
+     must remain observable by its parent. */
+  child->child = thread_current ()->tid;
+  lock_acquire (&child_lock);
+  list_push_back (&child_table, &child->elem);
+  lock_release (&child_lock);
+  thread_current ()->cmdline = xs->cmdline;
+  prog = palloc_get_page (0);
+  if (prog != NULL)
+    {
+      strlcpy (prog, xs->cmdline, PGSIZE);
+      prog_name = strtok_r (prog, " \t", &save_ptr);
+      memset (&if_, 0, sizeof if_);
+      if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
+      if_.cs = SEL_UCSEG;
+      if_.eflags = FLAG_IF | FLAG_MBS;
+      success = prog_name != NULL && load (prog_name, &if_.eip, &if_.esp);
+      palloc_free_page (prog);
+    }
 
   xs->success = success;
-  sema_up(&xs->done);
-
-  palloc_free_page (prog);
-
-  if (!success) {
-    thread_current()->exit_code = -1; // [Phase 5] load 실패 시 -1 설정
-    thread_exit();
-  }
-
+  sema_up (&xs->done);
+  /* The parent may free xs as soon as it wakes. */
+  if (!success)
+    thread_exit ();
   asm volatile ("movl %0, %%esp; jmp intr_exit" : : "g" (&if_) : "memory");
   NOT_REACHED ();
 }
 
+/* Waits once for a direct child and consumes its exit record. */
 int
 process_wait (tid_t child_tid)
 {
-  ct_init_once();
-  tid_t me = thread_current()->tid;
-
-  lock_acquire(&child_lock);
-  struct child_rec *r = ct_find(me, child_tid);
-  if (!r) { lock_release(&child_lock); return -1; }
-  if (r->waited){ lock_release(&child_lock); return -1; }
+  struct child_rec *r;
+  int code;
+  ct_init_once ();
+  lock_acquire (&child_lock);
+  r = ct_find (thread_current ()->tid, child_tid);
+  if (r == NULL || r->waited)
+    {
+      lock_release (&child_lock);
+      return -1;
+    }
   r->waited = true;
-  lock_release(&child_lock);
-
-  sema_down(&r->done);
-
-  lock_acquire(&child_lock);
-  int code = r->exit_code;
-  list_remove(&r->elem);
-  lock_release(&child_lock);
-  free(r);
+  lock_release (&child_lock);
+  sema_down (&r->done);
+  lock_acquire (&child_lock);
+  code = r->exit_code;
+  list_remove (&r->elem);
+  lock_release (&child_lock);
+  free (r);
   return code;
 }
 
+/* Release resources before waking a parent waiting for termination. */
 void
 process_exit (void)
 {
   struct thread *cur = thread_current ();
+  uint32_t *pd;
 
+  ct_init_once ();
+  ct_orphan_children (cur->tid);
   if (cur->pagedir != NULL)
-    {
-      printf ("%s: exit(%d)\n", cur->name, cur->exit_code);
-    }
-
-  ct_set_exit(cur->tid, cur->exit_code);
-
-  if (cur->exec_file) {
-    file_allow_write(cur->exec_file);
-    file_close(cur->exec_file);
-    cur->exec_file = NULL;
-  }
-
-  if (cur->cmdline) {
-    palloc_free_page(cur->cmdline);
-    cur->cmdline = NULL;
-  }
-
+    printf ("%s: exit(%d)\n", cur->name, cur->exit_code);
   if (cur->spt != NULL)
-  {
-    spt_destroy (cur->spt);
-    free (cur->spt);
-    cur->spt = NULL;
-  }
-
-  uint32_t *pd = cur->pagedir;
+    {
+      spt_destroy (cur->spt);
+      free (cur->spt);
+      cur->spt = NULL;
+    }
+  lock_acquire (&filesys_lock);
+  while (!list_empty (&cur->fdt))
+    {
+      struct file_desc *d = list_entry (list_pop_front (&cur->fdt),
+                                       struct file_desc, elem);
+      file_close (d->f);
+      free (d);
+    }
+  file_close (cur->exec_file);
+  cur->exec_file = NULL;
+  lock_release (&filesys_lock);
+  if (cur->cmdline != NULL)
+    {
+      palloc_free_page (cur->cmdline);
+      cur->cmdline = NULL;
+    }
+  pd = cur->pagedir;
   if (pd != NULL)
     {
       cur->pagedir = NULL;
       pagedir_activate (NULL);
       pagedir_destroy (pd);
     }
+  ct_set_exit (cur->tid, cur->exit_code);
 }
 
 void
@@ -341,7 +392,14 @@ load (const char *file_name, void (**eip) (void), void **esp)
   process_activate ();
 
   t->spt = malloc(sizeof *t->spt);
-  spt_init(t->spt);
+  if (t->spt == NULL)
+    goto done;
+  if (!spt_init (t->spt))
+    {
+      free (t->spt);
+      t->spt = NULL;
+      goto done;
+    }
 
   /* [Phase 5 Fix] filesys 접근 시 락 보호 (동시성 문제 해결) */
   lock_acquire(&filesys_lock);
@@ -618,6 +676,8 @@ setup_stack (void **esp)
           if (!push_u32(esp, 0)) { palloc_free_page(fn_copy); return false; }
 
           palloc_free_page(fn_copy);
+          pagedir_set_dirty (thread_current ()->pagedir, kpage, false);
+          vm_frame_unpin (kpage);
         }
       else
         {
