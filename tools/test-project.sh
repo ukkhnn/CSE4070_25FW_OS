@@ -10,6 +10,10 @@ case "$project" in
 esac
 { i686-linux-gnu-gcc --version; qemu-system-i386 --version; } > /results/toolchain.txt
 cp -a "/input/$project" /work/project
+cd /work/project/src
+# Discard only copied build artifacts; the input checkout stays read-only.
+rm -rf "$suite/build"
+make -C utils clean >/results/utils.log 2>&1
 python3 - <<'PY_MANIFEST' > /results/source.sha256
 from pathlib import Path
 import hashlib
@@ -18,8 +22,7 @@ for path in sorted(root.rglob("*")):
     if path.is_file():
         print(hashlib.sha256(path.read_bytes()).hexdigest(), path.relative_to(root))
 PY_MANIFEST
-cd /work/project/src
-if ! make -C utils setitimer-helper >/results/utils.log 2>&1; then
+if ! make -C utils setitimer-helper >>/results/utils.log 2>&1; then
   tail -30 /results/utils.log; exit 1
 fi
 export PATH="/work/project/src/utils:$PATH"
