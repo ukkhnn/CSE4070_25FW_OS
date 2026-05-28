@@ -1,0 +1,18 @@
+FAIL
+Test output failed to match any acceptable form.
+
+Acceptable output:
+  (priority-donate-handoff) begin
+  (priority-donate-handoff) New holder should have priority 32.  Actual priority: 32.
+  (priority-donate-handoff) Reacquiring holder should have priority 33.  Actual priority: 33.
+  (priority-donate-handoff) New holder should have priority 32.  Actual priority: 32.
+  (priority-donate-handoff) end
+Differences in `diff -u' format:
+  (priority-donate-handoff) begin
+- (priority-donate-handoff) New holder should have priority 32.  Actual priority: 32.
+- (priority-donate-handoff) Reacquiring holder should have priority 33.  Actual priority: 33.
+- (priority-donate-handoff) New holder should have priority 32.  Actual priority: 32.
++ (priority-donate-handoff) New holder should have priority 32.  Actual priority: 30.
++ (priority-donate-handoff) Reacquiring holder should have priority 33.  Actual priority: 0.
++ (priority-donate-handoff) New holder should have priority 32.  Actual priority: 30.
+  (priority-donate-handoff) end

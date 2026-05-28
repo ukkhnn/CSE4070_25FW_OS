@@ -1,0 +1,5 @@
+FAIL
+Kernel panic in run: PANIC at ../../filesys/inode.c:78 in inode_create(): assertion `length >= 0' failed.
+Call stack: 0xc0028b22c
+Translation of call stack:
+0xc0028b22c: (unknown)
